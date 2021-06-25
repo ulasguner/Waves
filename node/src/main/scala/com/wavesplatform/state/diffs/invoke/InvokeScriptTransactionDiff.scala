@@ -1,7 +1,5 @@
 package com.wavesplatform.state.diffs.invoke
 
-import scala.util.Right
-
 import cats.Id
 import cats.implicits._
 import com.wavesplatform.account._
@@ -10,29 +8,36 @@ import com.wavesplatform.common.utils.EitherExt2
 import com.wavesplatform.features.BlockchainFeatures
 import com.wavesplatform.features.EstimatorProvider._
 import com.wavesplatform.features.FunctionCallPolicyProvider._
+import com.wavesplatform.features.RideVersionProvider.RideVersionBlockchainExt
 import com.wavesplatform.lang._
 import com.wavesplatform.lang.contract.DApp
+import com.wavesplatform.lang.contract.DApp.{CallableAnnotation, CallableFunction}
 import com.wavesplatform.lang.directives.DirectiveSet
 import com.wavesplatform.lang.directives.values.{DApp => DAppType, _}
 import com.wavesplatform.lang.script.ContractScript.ContractScriptImpl
 import com.wavesplatform.lang.v1.ContractLimits
+import com.wavesplatform.lang.v1.FunctionHeader.User
 import com.wavesplatform.lang.v1.compiler.ContractCompiler
 import com.wavesplatform.lang.v1.compiler.Terms._
 import com.wavesplatform.lang.v1.estimator.v2.ScriptEstimatorV2
 import com.wavesplatform.lang.v1.evaluator._
 import com.wavesplatform.lang.v1.traits.Environment
 import com.wavesplatform.lang.v1.traits.domain._
-import com.wavesplatform.metrics.{TxProcessingStats => Stats}
 import com.wavesplatform.metrics.TxProcessingStats.TxTimerExt
+import com.wavesplatform.metrics.{TxProcessingStats => Stats}
+import com.wavesplatform.protobuf.dapp.DAppMeta
 import com.wavesplatform.state._
 import com.wavesplatform.state.reader.CompositeBlockchain
 import com.wavesplatform.transaction.Transaction
 import com.wavesplatform.transaction.TxValidationError._
-import com.wavesplatform.transaction.smart.{DApp => DAppTarget, _}
+import com.wavesplatform.transaction.smart.InvokeScriptTransaction.defaultCall
 import com.wavesplatform.transaction.smart.script.ScriptRunner.TxOrd
 import com.wavesplatform.transaction.smart.script.trace.{InvokeScriptTrace, TracedResult}
+import com.wavesplatform.transaction.smart.{DApp => DAppTarget, _}
 import monix.eval.Coeval
 import shapeless.Coproduct
+
+import scala.util.Right
 
 object InvokeScriptTransactionDiff {
 
@@ -44,12 +49,15 @@ object InvokeScriptTransactionDiff {
       tx: InvokeScriptTransaction
   ): TracedResult[ValidationError, Diff] = {
 
-    val dAppAddressEi = blockchain.resolveAlias(tx.dAppAddressOrAlias)
     val accScriptEi =
-      for (address <- dAppAddressEi;
-           script  <- blockchain.accountScript(address).toRight(GenericError(s"No contract at address ${tx.dAppAddressOrAlias}")))
-        yield (address, script)
-    val functionCall = tx.funcCall
+      for {
+        address <- blockchain.resolveAlias(tx.dAppAddressOrAlias)
+        scriptOpt = blockchain.accountScript(address)
+        script <- if (isLikeFreeCall(tx.exprOpt, scriptOpt))
+          extractFreeCall(blockchain, tx)
+        else
+          extractInvoke(tx, scriptOpt)
+      } yield (address, script)
 
     def executeInvoke(
         pk: PublicKey,
@@ -116,7 +124,7 @@ object InvokeScriptTransactionDiff {
             InvokeScriptTrace(
               tx.id(),
               tx.dAppAddressOrAlias,
-              functionCall,
+              tx.funcCall,
               scriptResultE.map(_.scriptResult),
               scriptResultE.fold(_.log, _.log)
             )
@@ -201,32 +209,20 @@ object InvokeScriptTransactionDiff {
       } yield (invocationComplexity.toInt, fixedInvocationComplexity.toInt)
     }
 
-    (accScriptEi: @unchecked) match {
-      case Right((dAppAddress, AccountScriptInfo(pk, ContractScriptImpl(version, contract), _, callableComplexities))) =>
-        val invocationTracker = DAppEnvironment.InvocationTreeTracker(DAppEnvironment.DAppInvocation(dAppAddress, tx.funcCall, tx.payments))
+    accScriptEi match {
+      case Right((dAppAddress, (pk, version, funcCall, contract, callableComplexities))) =>
+        val invocationTracker = DAppEnvironment.InvocationTreeTracker(DAppEnvironment.DAppInvocation(dAppAddress, funcCall, tx.payments))
         (for {
-          _                                                 <- TracedResult(checkCall(functionCall, blockchain).leftMap(GenericError(_)))
-          (invocationComplexity, fixedInvocationComplexity) <- calcInvocationComplexity(version, callableComplexities, dAppAddress)
+          _ <- TracedResult(checkCall(funcCall, blockchain).leftMap(GenericError(_)))
+          (invocationComplexity, fixedInvocationComplexity) <- if (callableComplexities.nonEmpty)
+            calcInvocationComplexity(version, callableComplexities, dAppAddress)
+          else TracedResult(Right((0, 0)))
 
-          (directives, payments, tthis, input) <- TracedResult(for {
+          (directives, tthis, input) <- TracedResult(for {
             directives <- DirectiveSet(version, Account, DAppType)
-            payments   <- AttachedPaymentExtractor.extractPayments(tx, version, blockchain, DAppTarget)
             tthis = Coproduct[Environment.Tthis](Recipient.Address(ByteStr(dAppAddress.bytes)))
             input <- buildThisValue(Coproduct[TxOrd](tx: Transaction), blockchain, directives, tthis)
-          } yield (directives, payments, tthis, input)).leftMap(GenericError(_))
-
-          invoker = Recipient.Address(ByteStr(tx.sender.toAddress.bytes))
-          invocation = ContractEvaluator.Invocation(
-            functionCall,
-            invoker,
-            tx.sender,
-            invoker,
-            tx.sender,
-            payments,
-            tx.id(),
-            tx.fee,
-            tx.feeAssetId.compatId
-          )
+          } yield (directives, tthis, input)).leftMap(GenericError(_))
 
           environment = new DAppEnvironment(
             AddressScheme.current.chainId,
@@ -247,7 +243,19 @@ object InvokeScriptTransactionDiff {
             if (version < V5) Diff.empty else InvokeDiffsCommon.paymentsPart(tx, dAppAddress, Map()),
             invocationTracker
           )
-
+          invoker  = Recipient.Address(ByteStr(tx.sender.toAddress.bytes))
+          payments = AttachedPaymentExtractor.extractPayments(tx, version, blockchain, DAppTarget).explicitGet()
+          invocation = ContractEvaluator.Invocation(
+            funcCall,
+            invoker,
+            tx.sender,
+            invoker,
+            tx.sender,
+            payments,
+            tx.id(),
+            tx.fee,
+            tx.feeAssetId.compatId
+          )
           result <- executeInvoke(pk, version, contract, dAppAddress, invocationComplexity, fixedInvocationComplexity, environment, invocation)
         } yield result).leftMap {
           case fte: FailedTransactionError => fte.copy(invocations = invocationTracker.toInvocationList)
@@ -257,6 +265,40 @@ object InvokeScriptTransactionDiff {
       case Left(error) => TracedResult(Left(error))
     }
   }
+
+  private def extractInvoke(
+      tx: InvokeScriptTransaction,
+      scriptOpt: Option[AccountScriptInfo]
+  ): Either[GenericError, (PublicKey, StdLibVersion, FUNCTION_CALL, DApp, Map[Int, Map[String, Long]])] =
+    scriptOpt
+      .collect {
+        case AccountScriptInfo(publicKey, ContractScriptImpl(version, dApp), _, complexities) =>
+          (publicKey, version, tx.funcCall, dApp, complexities)
+      }
+      .toRight(GenericError(s"No contract at address ${tx.dAppAddressOrAlias}"))
+
+  private def extractFreeCall(
+      blockchain: Blockchain,
+      tx: InvokeScriptTransaction
+  ): Either[GenericError, (PublicKey, StdLibVersion, FUNCTION_CALL, DApp, Map[Int, Map[String, Long]])] =
+    if (!blockchain.isFeatureActivated(BlockchainFeatures.BlockV5))
+      Left(GenericError("Free call is not activated yet"))
+    else if (tx.dAppAddressOrAlias != tx.senderAddress)
+      Left(GenericError("Free call could be performed only on the invoker account"))
+    else {
+      val callable = CallableFunction(CallableAnnotation("i"), FUNC(defaultCall.function.funcName, Nil, tx.exprOpt.get))
+      val dApp     = DApp(DAppMeta(), Nil, List(callable), None)
+      val version  = blockchain.actualRideVersion
+      Right((tx.sender, version, defaultCall, dApp, Map[Int, Map[String, Long]]()))
+    }
+
+  private def isLikeFreeCall(expr: Option[EXPR], scriptOpt: Option[AccountScriptInfo]): Boolean =
+    expr.fold(false) {
+      case FUNCTION_CALL(User(_, name), _) if scriptOpt.exists(_.complexitiesByEstimator.head._2.contains(name)) =>
+        false
+      case _ =>
+        true
+    }
 
   private def evaluateV2(
       version: StdLibVersion,
@@ -272,7 +314,7 @@ object InvokeScriptTransactionDiff {
     val evaluationCtx = CachedDAppCTX.get(version, blockchain).completeContext(environment)
     val startLimit    = limit - paymentsComplexity
     ContractEvaluator
-      .applyV2Coeval(evaluationCtx, Map(), contract, invocation, version, startLimit)
+      .applyV2Coeval(evaluationCtx, contract, invocation, version, startLimit)
       .runAttempt()
       .leftMap(error => (error.getMessage: ExecutionError, 0, Nil: Log[Id]))
       .flatten

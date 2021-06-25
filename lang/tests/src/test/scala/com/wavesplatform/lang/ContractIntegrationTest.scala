@@ -159,7 +159,6 @@ class ContractIntegrationTest extends PropSpec with PropertyChecks with ScriptGe
 
     ContractEvaluator.applyV2Coeval(
       ctx.evaluationContext(environment),
-      Map(),
       compiled,
       Invocation(
         Terms.FUNCTION_CALL(FunctionHeader.User(func), args),

@@ -32,7 +32,7 @@ class InvokeScriptTransactionSpecification extends PropSpec with PropertyChecks 
       val deser = InvokeScriptTransaction.parseBytes(bytes).get
       deser.sender shouldEqual transaction.sender
       deser.dAppAddressOrAlias shouldEqual transaction.dAppAddressOrAlias
-      deser.funcCallOpt shouldEqual transaction.funcCallOpt
+      deser.exprOpt shouldEqual transaction.exprOpt
       deser.payments shouldEqual transaction.payments
       deser.fee shouldEqual transaction.fee
       deser.timestamp shouldEqual transaction.timestamp
@@ -54,7 +54,7 @@ class InvokeScriptTransactionSpecification extends PropSpec with PropertyChecks 
         transaction.PBTransaction.Data.InvokeScript(
           InvokeScriptTransactionData(
             Some(PBRecipients.create(tx.dAppAddressOrAlias)),
-            ByteString.copyFrom(Deser.serializeOption(tx.funcCallOpt)(Serde.serialize(_))),
+            ByteString.copyFrom(Deser.serializeOption(tx.exprOpt)(Serde.serialize(_))),
             tx.payments.map(p => Amount.of(PBAmounts.toPBAssetId(p.assetId), p.amount))
           )
         )
