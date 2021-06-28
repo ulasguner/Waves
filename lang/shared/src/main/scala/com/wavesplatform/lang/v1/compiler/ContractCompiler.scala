@@ -21,6 +21,7 @@ import com.wavesplatform.lang.v1.task.imports._
 import com.wavesplatform.lang.v1.{ContractLimits, FunctionHeader, compiler}
 
 object ContractCompiler {
+  val FreeCallInvocationArg = "i"
 
   private def compileAnnotatedFunc(
       af: Expressions.ANNOTATEDFUNC,
@@ -402,7 +403,7 @@ object ContractCompiler {
     Parser.parseExpr(input) match {
       case fastparse.Parsed.Success(expr, _) =>
         val p          = AnyPos
-        val annotation = List(Expressions.ANNOTATION(p, PART.VALID(p, "Callable"), List(PART.VALID(p, "i"))))
+        val annotation = List(Expressions.ANNOTATION(p, PART.VALID(p, "Callable"), List(PART.VALID(p, FreeCallInvocationArg))))
         val function   = Expressions.FUNC(p, expr, PART.VALID(p, "default"), Nil)
         val dApp       = Expressions.DAPP(p, Nil, List(Expressions.ANNOTATEDFUNC(p, annotation, function)))
         ContractCompiler(ctx, dApp, version).map(_.callableFuncs.head.u.body)

@@ -82,7 +82,7 @@ object WavesContext {
     )
 
     val dAppFuncs =
-      if (contentType == DApp)
+      if (contentType == DApp || scriptType == Call)
         Array(callDAppF(version, reentrant = false), callDAppF(version, reentrant = true))
       else
         Array[BaseFunction[Environment]]()

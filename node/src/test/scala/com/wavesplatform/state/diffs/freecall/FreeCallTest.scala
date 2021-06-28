@@ -35,6 +35,7 @@ class FreeCallTest extends PropSpec with ScalaCheckPropertyChecks with Matchers 
          |   i.callerPublicKey       == publicKey &&
          |   i.originCallerPublicKey == publicKey &&
          |   i.fee                   == $fee      &&
+         |   i.payments              == []        &&
          |   i.feeAssetId            == unit
          | [
          |   BooleanEntry("check", check),
